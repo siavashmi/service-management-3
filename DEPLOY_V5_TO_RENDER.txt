@@ -1,0 +1,25 @@
+V5 RENDER DEPLOYMENT — QUICK GUIDE
+
+1. Create a GitHub repository and upload ALL files from this ZIP.
+2. In Render Dashboard choose New -> Blueprint.
+3. Select the GitHub repository.
+4. Render reads render.yaml.
+5. The Blueprint creates:
+   - service-usage-manager-v5
+   - service-usage-manager-db
+6. Enter the requested initial admin username/password.
+7. Apply the Blueprint.
+8. Check the web service logs.
+9. Open the generated URL.
+10. Login.
+
+Expected start command:
+uvicorn app:app --host 0.0.0.0 --port $PORT
+
+Expected health endpoint:
+/health
+
+Expected database connection:
+DATABASE_URL is injected automatically by Render from service-usage-manager-db.
+
+If deployment fails, send the complete Render build/runtime log and I can patch V5.
