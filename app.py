@@ -152,7 +152,7 @@ def render_home(request, records=None, edit=None, message=None, error=None, page
         records = rows("SELECT * FROM records ORDER BY id DESC LIMIT :lim OFFSET :off", {"lim":per_page,"off":(page-1)*per_page})
     # Stats are global, not page-limited.
     all_rs = rows("SELECT status FROM records")
-    return templates.TemplateResponse("index.html", {"request":request,"records":records,"stats":stats_for(all_rs),
+    return templates.TemplateResponse(request=request, name="index.html", context={"request":request,"records":records,"stats":stats_for(all_rs),
         "edit":edit,"message":message,"error":error,"page":page,"pages":pages,"csrf":csrf_token(request)})
 
 
@@ -165,20 +165,20 @@ def health():
 @app.get("/login", response_class=HTMLResponse)
 def login_page(request:Request):
     if current_user(request): return RedirectResponse("/",303)
-    return templates.TemplateResponse("login.html", {"request":request,"error":None,"csrf":csrf_token(request)})
+    return templates.TemplateResponse(request=request, name="login.html", context={"request":request,"error":None,"csrf":csrf_token(request)})
 
 
 @app.post("/login", response_class=HTMLResponse)
 def login(request:Request, username:str=Form(...), password:str=Form(...), csrf:str=Form("")):
     if not check_csrf(request, csrf):
-        return templates.TemplateResponse("login.html", {"request":request,"error":"Invalid security token. Refresh and try again.","csrf":csrf_token(request)}, status_code=400)
+        return templates.TemplateResponse(request=request, name="login.html", context={"request":request,"error":"Invalid security token. Refresh and try again.","csrf":csrf_token(request)}, status_code=400)
     with db() as c: u=c.execute(text("SELECT * FROM users WHERE username=:u"), {"u":username.strip()}).mappings().first()
     if u and pwd.verify(password, u["password_hash"]):
         request.session["user"]={"id":u["id"],"username":u["username"],"role":u["role"]}
         request.session["csrf_token"] = secrets.token_urlsafe(32)
         log_action(request,"login")
         return RedirectResponse("/",303)
-    return templates.TemplateResponse("login.html", {"request":request,"error":"Invalid username or password.","csrf":csrf_token(request)}, status_code=401)
+    return templates.TemplateResponse(request=request, name="login.html", context={"request":request,"error":"Invalid username or password.","csrf":csrf_token(request)}, status_code=401)
 
 
 @app.get("/logout")
@@ -301,7 +301,7 @@ def export_excel(request:Request):
 @app.get("/profile",response_class=HTMLResponse)
 def profile(request:Request):
     if not current_user(request): return redirect_login()
-    return templates.TemplateResponse("profile.html",{"request":request,"user":current_user(request),"error":None,"success":None,"csrf":csrf_token(request)})
+    return templates.TemplateResponse(request=request, name="profile.html", context={"request":request,"user":current_user(request),"error":None,"success":None,"csrf":csrf_token(request)})
 
 
 @app.post("/profile/password")
@@ -323,7 +323,7 @@ def users(request:Request):
     if not u: return redirect_login()
     if u["role"]!="admin": return RedirectResponse("/",303)
     with db() as c: us=[dict(x) for x in c.execute(text("SELECT id,username,role,created_at FROM users ORDER BY id")).mappings().all()]
-    return templates.TemplateResponse("users.html",{"request":request,"users":us,"error":request.query_params.get("error"),"csrf":csrf_token(request)})
+    return templates.TemplateResponse(request=request, name="users.html", context={"request":request,"users":us,"error":request.query_params.get("error"),"csrf":csrf_token(request)})
 
 
 @app.post("/users")
