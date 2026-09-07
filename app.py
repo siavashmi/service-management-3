@@ -46,6 +46,9 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 templates = Jinja2Templates(directory=str(BASE / "templates"))
 
 FIELDS = ["province","type","source_ne","source_port","direction","dest_ne","dest_port","rate_type","rate_number","status","service"]
+# Fields that get their dropdown/datalist choices dynamically from existing records.
+DROPDOWN_FIELDS = ["direction","source_ne","source_port","dest_ne","dest_port"]
+DEFAULT_DIRECTIONS = ["In","Out","Both"]
 
 
 def db():
@@ -137,6 +140,29 @@ def log_action(request, action, target_type="", target_id="", details=""):
                    "tt":target_type, "tid":str(target_id) if target_id else "", "d":details})
 
 
+def distinct_values(field):
+    """Return the unique, non-empty values currently stored for `field`,
+    sorted case-insensitively. `field` must come from DROPDOWN_FIELDS (a
+    fixed whitelist) since it is interpolated into the SQL identifier."""
+    if field not in DROPDOWN_FIELDS:
+        raise ValueError(f"Unsupported dropdown field: {field}")
+    order = f"{field} COLLATE NOCASE" if DB_IS_SQLITE else f"LOWER({field})"
+    rs = rows(f"SELECT DISTINCT {field} AS v FROM records "
+              f"WHERE {field} IS NOT NULL AND TRIM({field}) <> '' "
+              f"ORDER BY {order}")
+    return [r["v"] for r in rs]
+
+
+def dropdown_choices():
+    """Distinct values for every dropdown field, deduplicated."""
+    choices = {f: distinct_values(f) for f in DROPDOWN_FIELDS}
+    # Direction always offers the standard set, plus any extra values
+    # already used in records (e.g. imported from Excel), without duplicates.
+    extra = [d for d in choices["direction"] if d.lower() not in (x.lower() for x in DEFAULT_DIRECTIONS)]
+    choices["direction"] = DEFAULT_DIRECTIONS + extra
+    return choices
+
+
 def stats_for(rs):
     return {"total":len(rs), "used":sum(x.get("status")=="Used" for x in rs),
             "free":sum(x.get("status")=="Free" for x in rs), "reserved":sum(x.get("status")=="Reserved" for x in rs)}
@@ -153,7 +179,8 @@ def render_home(request, records=None, edit=None, message=None, error=None, page
     # Stats are global, not page-limited.
     all_rs = rows("SELECT status FROM records")
     return templates.TemplateResponse(request=request, name="index.html", context={"request":request,"records":records,"stats":stats_for(all_rs),
-        "edit":edit,"message":message,"error":error,"page":page,"pages":pages,"csrf":csrf_token(request)})
+        "edit":edit,"message":message,"error":error,"page":page,"pages":pages,"csrf":csrf_token(request),
+        "dropdowns":dropdown_choices()})
 
 
 @app.get("/health")
