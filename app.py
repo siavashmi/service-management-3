@@ -143,14 +143,15 @@ def log_action(request, action, target_type="", target_id="", details=""):
 def distinct_values(field):
     """Return the unique, non-empty values currently stored for `field`,
     sorted case-insensitively. `field` must come from DROPDOWN_FIELDS (a
-    fixed whitelist) since it is interpolated into the SQL identifier."""
+    fixed whitelist) since it is interpolated into the SQL identifier.
+    Sorting is done in Python (not SQL ORDER BY) because Postgres rejects
+    ORDER BY expressions that aren't in a SELECT DISTINCT's select list,
+    while SQLite is more permissive - doing it in Python works on both."""
     if field not in DROPDOWN_FIELDS:
         raise ValueError(f"Unsupported dropdown field: {field}")
-    order = f"{field} COLLATE NOCASE" if DB_IS_SQLITE else f"LOWER({field})"
     rs = rows(f"SELECT DISTINCT {field} AS v FROM records "
-              f"WHERE {field} IS NOT NULL AND TRIM({field}) <> '' "
-              f"ORDER BY {order}")
-    return [r["v"] for r in rs]
+              f"WHERE {field} IS NOT NULL AND TRIM({field}) <> ''")
+    return sorted((r["v"] for r in rs), key=str.lower)
 
 
 def dropdown_choices():
