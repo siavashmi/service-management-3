@@ -57,6 +57,13 @@ DEFAULT_DIRECTIONS = ["In","Out","Both"]
 # that combining several of them in one query narrows results with AND,
 # rather than each one doing a loose partial-text match.
 EXACT_QUERY_FIELDS = {"province","type","source_ne","source_port","direction","dest_ne","dest_port","rate_type","rate_number","status"}
+# A physical link between two NEs can be logged from either end, so
+# Source NE/Port and Destination NE/Port are treated as a mirrored pair:
+# a record with source_ne=X, dest_ne=Y is the "same connection" as one
+# logged with source_ne=Y, dest_ne=X. ENDPOINT_MIRROR maps each of these
+# fields to its counterpart on the other end of the link.
+ENDPOINT_FIELDS = ["source_ne","source_port","dest_ne","dest_port"]
+ENDPOINT_MIRROR = {"source_ne":"dest_ne","dest_ne":"source_ne","source_port":"dest_port","dest_port":"source_port"}
 
 
 def db():
@@ -148,6 +155,52 @@ def log_action(request, action, target_type="", target_id="", details=""):
                    "tt":target_type, "tid":str(target_id) if target_id else "", "d":details})
 
 
+def endpoint_matches(given, extra_filters=None):
+    """Find records whose Source/Destination NE+Port match `given` (a dict
+    with any subset of source_ne/source_port/dest_ne/dest_port) either on
+    the forward side (as given) or the reversed/mirrored side, since the
+    same physical link may be logged from either endpoint. `extra_filters`
+    (e.g. province, status) is applied as a normal AND on top of either side.
+
+    Returns a list of (row_dict, swapped) tuples, where `swapped` is True
+    when a row only matched on the mirrored side - meaning source_ne/
+    source_port should be displayed as dest_ne/dest_port for that row (and
+    vice versa) to match the orientation the user searched from. Returns an
+    empty list if `given` has no usable values."""
+    given = {k: (v or "").strip() for k, v in given.items() if k in ENDPOINT_FIELDS and (v or "").strip() and v != "All"}
+    if not given:
+        return []
+    fwd_clauses, rev_clauses, params = [], [], {}
+    for k, v in given.items():
+        fwd_clauses.append(f"LOWER({k})=LOWER(:ep_{k})")
+        rev_clauses.append(f"LOWER({ENDPOINT_MIRROR[k]})=LOWER(:ep_{k})")
+        params[f"ep_{k}"] = v
+    where = "(" + " AND ".join(fwd_clauses) + ") OR (" + " AND ".join(rev_clauses) + ")"
+    extra_clauses = []
+    for k, v in (extra_filters or {}).items():
+        if k in ENDPOINT_FIELDS: continue
+        v = (v or "").strip()
+        if not v or v == "All": continue
+        if k == "id":
+            try:
+                extra_clauses.append("id=:ex_id"); params["ex_id"] = int(v)
+            except ValueError:
+                extra_clauses.append("1=0")
+            continue
+        if k not in FIELDS: continue
+        extra_clauses.append(f"LOWER({k})=LOWER(:ex_{k})" if k in EXACT_QUERY_FIELDS else f"LOWER({k}) LIKE LOWER(:ex_{k})")
+        params[f"ex_{k}"] = v if k in EXACT_QUERY_FIELDS else f"%{v}%"
+    if extra_clauses:
+        where = f"({where}) AND " + " AND ".join(extra_clauses)
+    rs = rows(f"SELECT * FROM records WHERE {where}", params)
+    out = []
+    for r in rs:
+        row = dict(r)
+        is_forward = all((row.get(k) or "").strip().lower() == v.lower() for k, v in given.items())
+        out.append((row, not is_forward))
+    return out
+
+
 def distinct_values(field, filters=None):
     """Return the unique, non-empty values currently stored for `field`,
     sorted case-insensitively. `field` must come from QUERY_DROPDOWN_FIELDS
@@ -177,8 +230,32 @@ def distinct_values(field, filters=None):
 
 def dropdown_choices(filters=None):
     """Distinct values for every dropdown field, deduplicated, optionally
-    narrowed by other already-selected values (see distinct_values)."""
-    choices = {f: distinct_values(f, filters) for f in QUERY_DROPDOWN_FIELDS}
+    narrowed by other already-selected values (see distinct_values).
+
+    For source_ne/source_port/dest_ne/dest_port specifically, this also
+    checks the mirrored side of the link (see endpoint_matches): e.g. if
+    Source NE=E was typed but E only appears as a Destination NE in the
+    data, Source Port/Destination NE/Destination Port still populate from
+    that matching record's fields, appropriately swapped."""
+    filters = filters or {}
+    endpoint_sel = {k: filters.get(k, "") for k in ENDPOINT_FIELDS}
+    non_endpoint = {k: v for k, v in filters.items() if k not in ENDPOINT_FIELDS}
+    choices = {}
+    for f in QUERY_DROPDOWN_FIELDS:
+        if f in ENDPOINT_FIELDS:
+            other = {k: v for k, v in endpoint_sel.items() if k != f}
+            matches = endpoint_matches(other, non_endpoint)
+            if not matches:
+                choices[f] = distinct_values(f, filters)
+            else:
+                vals = set()
+                for row, swapped in matches:
+                    col = ENDPOINT_MIRROR[f] if swapped else f
+                    v = (row.get(col) or "").strip()
+                    if v: vals.add(v)
+                choices[f] = sorted(vals, key=str.lower)
+        else:
+            choices[f] = distinct_values(f, filters)
     # Direction always offers the standard set, plus any extra values
     # already used in matching records (e.g. imported from Excel), without duplicates.
     extra = [d for d in choices["direction"] if d.lower() not in (x.lower() for x in DEFAULT_DIRECTIONS)]
@@ -308,26 +385,42 @@ def query_options(request:Request,province:str="",type:str="",source_ne:str="",s
 @app.get("/query",response_class=HTMLResponse)
 def query(request:Request,id:str="",province:str="",type:str="",source_ne:str="",source_port:str="",direction:str="",dest_ne:str="",dest_port:str="",rate_type:str="",rate_number:str="",status:str="",service:str=""):
     if not current_user(request): return redirect_login()
-    vals={"id":id,"province":province,"type":type,"source_ne":source_ne,"source_port":source_port,"direction":direction,"dest_ne":dest_ne,"dest_port":dest_port,"rate_type":rate_type,"rate_number":rate_number,"status":status,"service":service}
-    # Every filled-in field is combined with AND, so filtering on several
-    # fields at once (e.g. Direction + Destination NE + Status) narrows the
-    # results instead of only the last field taking effect.
-    clauses=[]; params={}
-    for k,v in vals.items():
-        v=v.strip() if isinstance(v,str) else v
-        if not v or v=="All": continue
-        if k=="id":
-            try: clauses.append("id=:id"); params["id"]=int(v)
-            except: clauses.append("1=0")
-        elif k in EXACT_QUERY_FIELDS:
-            # These come from dropdown lists of known values, so match exactly
-            # (case-insensitively) rather than a loose substring search.
-            clauses.append(f"LOWER({k})=LOWER(:{k})"); params[k]=v
-        else:
-            clauses.append(f"LOWER({k}) LIKE LOWER(:{k})"); params[k]="%"+v+"%"
-    where=(" WHERE "+" AND ".join(clauses)) if clauses else ""
-    rs=rows("SELECT * FROM records"+where+" ORDER BY id DESC",params)
-    return render_home(request,records=rs,message=f"Found {len(rs)} record(s)",page=1,pages=1)
+    endpoint_sel={"source_ne":source_ne,"source_port":source_port,"dest_ne":dest_ne,"dest_port":dest_port}
+    given_endpoint={k:v for k,v in endpoint_sel.items() if (v or "").strip() and v!="All"}
+    other_vals={"id":id,"province":province,"type":type,"direction":direction,"rate_type":rate_type,"rate_number":rate_number,"status":status,"service":service}
+    if given_endpoint:
+        # A link between two NEs can be logged from either end, so Source
+        # NE/Port and Destination NE/Port are matched as a pair against
+        # either the forward or the reversed (swapped) columns - see
+        # endpoint_matches(). Records found only via the reversed side are
+        # then displayed with source/destination swapped, so the table
+        # reflects the orientation the user actually searched from.
+        matches=endpoint_matches(given_endpoint, other_vals)
+        display=[]
+        for row,swapped in matches:
+            if swapped:
+                row=dict(row)
+                row["source_ne"],row["dest_ne"]=row.get("dest_ne"),row.get("source_ne")
+                row["source_port"],row["dest_port"]=row.get("dest_port"),row.get("source_port")
+            display.append(row)
+        display.sort(key=lambda r:r.get("id") or 0, reverse=True)
+    else:
+        # No Source/Destination NE or Port given - plain AND search on
+        # whatever other fields were filled in, as before.
+        clauses=[]; params={}
+        for k,v in other_vals.items():
+            v=v.strip() if isinstance(v,str) else v
+            if not v or v=="All": continue
+            if k=="id":
+                try: clauses.append("id=:id"); params["id"]=int(v)
+                except: clauses.append("1=0")
+            elif k in EXACT_QUERY_FIELDS:
+                clauses.append(f"LOWER({k})=LOWER(:{k})"); params[k]=v
+            else:
+                clauses.append(f"LOWER({k}) LIKE LOWER(:{k})"); params[k]="%"+v+"%"
+        where=(" WHERE "+" AND ".join(clauses)) if clauses else ""
+        display=rows("SELECT * FROM records"+where+" ORDER BY id DESC",params)
+    return render_home(request,records=display,message=f"Found {len(display)} record(s)",page=1,pages=1)
 
 
 @app.post("/import")
