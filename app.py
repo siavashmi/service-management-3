@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request, Form, UploadFile, File
-from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
@@ -47,8 +47,10 @@ templates = Jinja2Templates(directory=str(BASE / "templates"))
 
 FIELDS = ["province","type","source_ne","source_port","direction","dest_ne","dest_port","rate_type","rate_number","status","service"]
 # Fields whose dropdown choices are pulled live from existing records (used by
-# the main-page Direction field and by the Advanced Query dropdowns).
-QUERY_DROPDOWN_FIELDS = ["direction","source_ne","source_port","dest_ne","dest_port","rate_type","rate_number","status"]
+# the main-page Direction field and by the Advanced Query dropdowns). These
+# are also the fields that cascade off each other in Advanced Query: picking
+# a value in one narrows the option lists shown for all the others.
+QUERY_DROPDOWN_FIELDS = ["province","type","direction","source_ne","source_port","dest_ne","dest_port","rate_type","rate_number","status"]
 DEFAULT_DIRECTIONS = ["In","Out","Both"]
 # Advanced Query fields that are populated from a fixed/dynamic dropdown list
 # (as opposed to freeform text). These are matched with exact equality so
@@ -146,25 +148,39 @@ def log_action(request, action, target_type="", target_id="", details=""):
                    "tt":target_type, "tid":str(target_id) if target_id else "", "d":details})
 
 
-def distinct_values(field):
+def distinct_values(field, filters=None):
     """Return the unique, non-empty values currently stored for `field`,
     sorted case-insensitively. `field` must come from QUERY_DROPDOWN_FIELDS
     (a fixed whitelist) since it is interpolated into the SQL identifier.
+
+    `filters` is an optional {field: value} dict of *other* already-selected
+    dropdown values (e.g. province="A", source_ne="B") - when given, only
+    records matching all of them are considered, which is what makes the
+    Advanced Query dropdowns cascade off each other. `field` itself is
+    ignored if present in `filters`, since a field can't filter itself.
+
     Sorting is done in Python (not SQL ORDER BY) because Postgres rejects
     ORDER BY expressions that aren't in a SELECT DISTINCT's select list,
     while SQLite is more permissive - doing it in Python works on both."""
     if field not in QUERY_DROPDOWN_FIELDS:
         raise ValueError(f"Unsupported dropdown field: {field}")
-    rs = rows(f"SELECT DISTINCT {field} AS v FROM records "
-              f"WHERE {field} IS NOT NULL AND TRIM({field}) <> ''")
+    clauses = [f"{field} IS NOT NULL", f"TRIM({field}) <> ''"]
+    params = {}
+    for k, v in (filters or {}).items():
+        if k == field or k not in QUERY_DROPDOWN_FIELDS: continue
+        v = (v or "").strip()
+        if not v or v == "All": continue
+        clauses.append(f"LOWER({k})=LOWER(:{k})"); params[k] = v
+    rs = rows(f"SELECT DISTINCT {field} AS v FROM records WHERE " + " AND ".join(clauses), params)
     return sorted((r["v"] for r in rs), key=str.lower)
 
 
-def dropdown_choices():
-    """Distinct values for every dropdown field, deduplicated."""
-    choices = {f: distinct_values(f) for f in QUERY_DROPDOWN_FIELDS}
+def dropdown_choices(filters=None):
+    """Distinct values for every dropdown field, deduplicated, optionally
+    narrowed by other already-selected values (see distinct_values)."""
+    choices = {f: distinct_values(f, filters) for f in QUERY_DROPDOWN_FIELDS}
     # Direction always offers the standard set, plus any extra values
-    # already used in records (e.g. imported from Excel), without duplicates.
+    # already used in matching records (e.g. imported from Excel), without duplicates.
     extra = [d for d in choices["direction"] if d.lower() not in (x.lower() for x in DEFAULT_DIRECTIONS)]
     choices["direction"] = DEFAULT_DIRECTIONS + extra
     return choices
@@ -273,6 +289,20 @@ def delete(request:Request, ids:list[int]=Form(...), csrf:str=Form("")):
         for i in ids: c.execute(text("DELETE FROM records WHERE id=:id"),{"id":i})
     log_action(request,"delete","record",",".join(map(str,ids)))
     return RedirectResponse("/?success=deleted",303)
+
+
+@app.get("/query/options")
+def query_options(request:Request,province:str="",type:str="",source_ne:str="",source_port:str="",direction:str="",dest_ne:str="",dest_port:str="",rate_type:str="",rate_number:str="",status:str=""):
+    """Used by the Advanced Query dialog to cascade its dropdowns: given
+    whatever the user has already selected in the other fields, returns the
+    set of values each dropdown could still show. Selecting Province=A limits
+    Source NE to NEs seen with province A; then also selecting Source NE=B
+    limits Source Port to ports seen with province A and source_ne B; and so on
+    for every dropdown field, each narrowed by every other current selection."""
+    if not current_user(request): return JSONResponse({"error":"unauthorized"},status_code=401)
+    filters={"province":province,"type":type,"source_ne":source_ne,"source_port":source_port,"direction":direction,
+             "dest_ne":dest_ne,"dest_port":dest_port,"rate_type":rate_type,"rate_number":rate_number,"status":status}
+    return dropdown_choices(filters)
 
 
 @app.get("/query",response_class=HTMLResponse)
