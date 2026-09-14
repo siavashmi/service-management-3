@@ -46,9 +46,15 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 templates = Jinja2Templates(directory=str(BASE / "templates"))
 
 FIELDS = ["province","type","source_ne","source_port","direction","dest_ne","dest_port","rate_type","rate_number","status","service"]
-# Fields that get their dropdown/datalist choices dynamically from existing records.
-DROPDOWN_FIELDS = ["direction","source_ne","source_port","dest_ne","dest_port"]
+# Fields whose dropdown choices are pulled live from existing records (used by
+# the main-page Direction field and by the Advanced Query dropdowns).
+QUERY_DROPDOWN_FIELDS = ["direction","source_ne","source_port","dest_ne","dest_port","rate_type","rate_number","status"]
 DEFAULT_DIRECTIONS = ["In","Out","Both"]
+# Advanced Query fields that are populated from a fixed/dynamic dropdown list
+# (as opposed to freeform text). These are matched with exact equality so
+# that combining several of them in one query narrows results with AND,
+# rather than each one doing a loose partial-text match.
+EXACT_QUERY_FIELDS = {"province","type","source_ne","source_port","direction","dest_ne","dest_port","rate_type","rate_number","status"}
 
 
 def db():
@@ -142,12 +148,12 @@ def log_action(request, action, target_type="", target_id="", details=""):
 
 def distinct_values(field):
     """Return the unique, non-empty values currently stored for `field`,
-    sorted case-insensitively. `field` must come from DROPDOWN_FIELDS (a
-    fixed whitelist) since it is interpolated into the SQL identifier.
+    sorted case-insensitively. `field` must come from QUERY_DROPDOWN_FIELDS
+    (a fixed whitelist) since it is interpolated into the SQL identifier.
     Sorting is done in Python (not SQL ORDER BY) because Postgres rejects
     ORDER BY expressions that aren't in a SELECT DISTINCT's select list,
     while SQLite is more permissive - doing it in Python works on both."""
-    if field not in DROPDOWN_FIELDS:
+    if field not in QUERY_DROPDOWN_FIELDS:
         raise ValueError(f"Unsupported dropdown field: {field}")
     rs = rows(f"SELECT DISTINCT {field} AS v FROM records "
               f"WHERE {field} IS NOT NULL AND TRIM({field}) <> ''")
@@ -156,7 +162,7 @@ def distinct_values(field):
 
 def dropdown_choices():
     """Distinct values for every dropdown field, deduplicated."""
-    choices = {f: distinct_values(f) for f in DROPDOWN_FIELDS}
+    choices = {f: distinct_values(f) for f in QUERY_DROPDOWN_FIELDS}
     # Direction always offers the standard set, plus any extra values
     # already used in records (e.g. imported from Excel), without duplicates.
     extra = [d for d in choices["direction"] if d.lower() not in (x.lower() for x in DEFAULT_DIRECTIONS)]
@@ -273,14 +279,22 @@ def delete(request:Request, ids:list[int]=Form(...), csrf:str=Form("")):
 def query(request:Request,id:str="",province:str="",type:str="",source_ne:str="",source_port:str="",direction:str="",dest_ne:str="",dest_port:str="",rate_type:str="",rate_number:str="",status:str="",service:str=""):
     if not current_user(request): return redirect_login()
     vals={"id":id,"province":province,"type":type,"source_ne":source_ne,"source_port":source_port,"direction":direction,"dest_ne":dest_ne,"dest_port":dest_port,"rate_type":rate_type,"rate_number":rate_number,"status":status,"service":service}
+    # Every filled-in field is combined with AND, so filtering on several
+    # fields at once (e.g. Direction + Destination NE + Status) narrows the
+    # results instead of only the last field taking effect.
     clauses=[]; params={}
     for k,v in vals.items():
-        if v and v!="All":
-            if k=="id":
-                try: clauses.append("id=:id"); params["id"]=int(v)
-                except: clauses.append("1=0")
-            else:
-                clauses.append(f"LOWER({k}) LIKE LOWER(:{k})"); params[k]="%"+v+"%"
+        v=v.strip() if isinstance(v,str) else v
+        if not v or v=="All": continue
+        if k=="id":
+            try: clauses.append("id=:id"); params["id"]=int(v)
+            except: clauses.append("1=0")
+        elif k in EXACT_QUERY_FIELDS:
+            # These come from dropdown lists of known values, so match exactly
+            # (case-insensitively) rather than a loose substring search.
+            clauses.append(f"LOWER({k})=LOWER(:{k})"); params[k]=v
+        else:
+            clauses.append(f"LOWER({k}) LIKE LOWER(:{k})"); params[k]="%"+v+"%"
     where=(" WHERE "+" AND ".join(clauses)) if clauses else ""
     rs=rows("SELECT * FROM records"+where+" ORDER BY id DESC",params)
     return render_home(request,records=rs,message=f"Found {len(rs)} record(s)",page=1,pages=1)
